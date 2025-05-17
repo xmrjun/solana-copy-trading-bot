@@ -1,0 +1,22 @@
+{
+  "name": "solana-copy-trading-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@jup-ag/core": "^4.0.0-beta.21",
+    "@jup-ag/raydium-clmm-sdk": "^1.0.6",
+    "@solana/spl-token": "^0.4.8",
+    "@solana/web3.js": "^1.95.3",
+    "axios": "^1.9.0",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.5.0",
+    "rpc-websockets": "^9.0.2"
+  }
+}

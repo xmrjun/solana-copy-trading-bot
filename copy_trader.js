@@ -1,20 +1,18 @@
 require('dotenv').config();
-const { Connection, Keypair, PublicKey } = require('@solana/web3.js');
-const { TOKEN_PROGRAM_ID, getOrCreateAssociatedTokenAccount } = require('@solana/spl-token');
-const { Jupiter } = require('@jup-ag/core');
+const { Connection, Keypair, PublicKey, VersionedTransaction } = require('@solana/web3.js');
 const axios = require('axios');
 const bs58 = require('bs58');
 const fs = require('fs').promises;
 const path = require('path');
 
 // 配置
-const RPC_URL = 'https://mainnet.helius-rpc.com/?api-key=690caee5-296e-490d-b1f2-c6e2247adfea';
+const RPC_URL = 'https://mainnet.helius-rpc.com/?api-key=cdd2340d-0673-4951-a36d-de98e9310f45';
 const WEBHOOK_EVENTS_URL = 'http://185.84.224.246:3000/events';
 const PROCESSED_FILE = path.join(__dirname, 'processed_transactions.json');
 const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY;
-const MIN_TOKEN_AMOUNT = 0.1;
-const MIN_SOL_AMOUNT = 10000000; // 0.01 SOL
-const MAX_AGE_SECONDS = 120; // 2 分钟
+const MIN_TOKEN_AMOUNT = 0.01;
+const MIN_SOL_AMOUNT = 1000000; // 0.001 SOL
+const MAX_AGE_SECONDS = 3600; // 1 小时
 const FUTURE_TIME_THRESHOLD = 86400; // 1 天
 const MONITORED_WALLETS = [
     'ABUqmjGYiZd4mFxVa2ZV4zZUUbB7a7U7EvoPkw4YHvC6',
@@ -65,6 +63,7 @@ try {
 async function fetchEvents() {
     try {
         const response = await axios.get(WEBHOOK_EVENTS_URL);
+        console.log('Webhook 原始数据:', JSON.stringify(response.data, null, 2));
         console.log('Webhook 返回事件数量:', response.data.length);
         return response.data;
     } catch (error) {
@@ -109,8 +108,7 @@ async function isProcessed(signature) {
 
 async function executeSwap(event) {
     const transaction = event[0];
-    // 验证必要字段
-    if (!transaction || !transaction.signature || !transaction.source || !transaction.timestamp || !transaction.tokenTransfers || !transaction.nativeTransfers) {
+    if (!transaction || !transaction.signature || !transaction.timestamp || !transaction.tokenTransfers || !transaction.nativeTransfers) {
         console.log(`跳过无效交易: 签名=${transaction?.signature || '缺失'}, 原因: 缺少必要字段`);
         if (transaction?.signature) {
             await saveProcessedTransaction(transaction.signature);
@@ -119,13 +117,6 @@ async function executeSwap(event) {
     }
 
     const { signature, tokenTransfers, nativeTransfers, source, timestamp } = transaction;
-    if (source !== 'PUMP_FUN' && source !== 'JUPITER') {
-        console.log(`忽略非 Pump.fun/Jupiter 交易: ${signature}, 来源: ${source}`);
-        await saveProcessedTransaction(signature);
-        return;
-    }
-
-    // 检查时间戳
     const currentTime = Math.floor(Date.now() / 1000);
     const normalizedTimestamp = timestamp > 1000000000000 ? Math.floor(timestamp / 1000) : timestamp;
     if (!normalizedTimestamp || typeof normalizedTimestamp !== 'number' || isNaN(normalizedTimestamp) || normalizedTimestamp > currentTime + FUTURE_TIME_THRESHOLD || (currentTime - normalizedTimestamp > MAX_AGE_SECONDS)) {
@@ -152,45 +143,56 @@ async function executeSwap(event) {
             continue;
         }
 
+        if (mint === 'So11111111111111111111111111111111111111112') {
+            console.log(`跳过 SOL 转账（卖出交易）: ${signature}, 代币: ${mint}, 数量: ${tokenAmount}`);
+            continue;
+        }
+
         if (MONITORED_WALLETS.some(w => toUserAccount.startsWith(w.slice(0, 8)))) {
             for (let attempt = 1; attempt <= 3; attempt++) {
                 try {
-                    console.log(`检测到买入: ${signature}, 代币: ${mint}, 数量: ${tokenAmount}, 尝试: ${attempt}`);
-                    if (source === 'JUPITER') {
-                        const jupiter = await Jupiter.load({
-                            connection,
-                            cluster: 'mainnet-beta',
-                            user: wallet.publicKey,
-                        });
-                        const quote = await jupiter.getQuote({
-                            inputMint: new PublicKey('So11111111111111111111111111111111111111112'),
-                            outputMint: new PublicKey(mint),
-                            amount: 2000, // 0.000002 SOL
-                            slippageBps: 1000 // 10% 滑点
-                        });
-                        console.log('报价:', JSON.stringify(quote, null, 2));
-                        const { swapTransaction } = await jupiter.exchange({ routeInfo: quote });
-                        const tx = swapTransaction;
-                        const txid = await connection.sendRawTransaction(tx.serialize(), {
-                            skipPreflight: false,
-                            maxRetries: 2
-                        });
-                        await connection.confirmTransaction(txid, 'confirmed');
-                        console.log(`Jupiter 跟单成功: ${txid}, 代币: ${mint}, 数量: ${tokenAmount}`);
-                        await saveProcessedTransaction(signature);
-                        return;
-                    } else {
-                        console.log(`Pump.fun 跟单待实现: ${signature}`);
-                        await saveProcessedTransaction(signature);
-                        return;
-                    }
+                    console.log(`检测到买入: ${signature}, 代币: ${mint}, 数量: ${tokenAmount}, 来源: ${source}, 尝试: ${attempt}`);
+                    const quoteResponse = await axios.get('https://quote-api.jup.ag/v6/quote', {
+                        params: {
+                            inputMint: 'So11111111111111111111111111111111111111112',
+                            outputMint: mint,
+                            amount: 10000000,
+                            slippageBps: 1000
+                        }
+                    });
+                    const quote = quoteResponse.data;
+                    console.log('报价:', JSON.stringify(quote, null, 2));
+
+                    const swapResponse = await axios.post('https://quote-api.jup.ag/v6/swap', {
+                        quoteResponse: quote,
+                        userPublicKey: wallet.publicKey.toBase58()
+                    });
+                    const { swapTransaction } = swapResponse.data;
+
+                    const swapTxBuf = Buffer.from(swapTransaction, 'base64');
+                    const transaction = VersionedTransaction.deserialize(swapTxBuf);
+                    transaction.sign([wallet]);
+
+                    const txid = await connection.sendRawTransaction(transaction.serialize(), {
+                        skipPreflight: false,
+                        maxRetries: 5,
+                        preflightCommitment: 'confirmed'
+                    });
+                    await connection.confirmTransaction({
+                        signature: txid,
+                        blockhash: transaction.message.recentBlockhash,
+                        lastValidBlockHeight: (await connection.getLatestBlockhash()).lastValidBlockHeight
+                    }, 'confirmed', { commitment: 'confirmed', timeout: 60000 });
+                    console.log(`Jupiter 跟单成功: ${txid}, 代币: ${mint}, 数量: ${tokenAmount}`);
+                    await saveProcessedTransaction(signature);
+                    return;
                 } catch (error) {
-                    console.error(`跟单失败: ${signature}, 尝试: ${attempt}, 错误:`, error.message, error.stack);
+                    console.error(`跟单失败: ${signature}, 尝试: ${attempt}, 错误:`, error.message);
                     if (attempt === 3) {
                         console.error(`最终失败: ${signature}, 不再重试`);
                         await saveProcessedTransaction(signature);
                     }
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    await new Promise(resolve => setTimeout(resolve, 2000));
                 }
             }
         }
@@ -203,22 +205,16 @@ async function main() {
         const events = await fetchEvents();
         console.log(`获取到 ${events.length} 条事件`);
         for (const event of events) {
-            // 验证事件格式
             if (!event || !Array.isArray(event) || event.length === 0) {
                 console.log('跳过无效事件:', JSON.stringify(event));
                 continue;
             }
             const transaction = event[0];
-            if (!transaction || !transaction.type || !transaction.signature) {
+            if (!transaction || !transaction.signature) {
                 console.log(`跳过无效交易: 签名=${transaction?.signature || '缺失'}, 类型=${transaction?.type || '缺失'}`);
                 if (transaction?.signature) {
                     await saveProcessedTransaction(transaction.signature);
                 }
-                continue;
-            }
-            if (transaction.type !== 'SWAP') {
-                console.log(`忽略非 SWAP 交易: ${signature}, 类型: ${transaction.type}`);
-                await saveProcessedTransaction(transaction.signature);
                 continue;
             }
             if (await isProcessed(transaction.signature)) continue;
