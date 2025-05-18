@@ -1,2 +1,5 @@
-.env
-processed_transactions.json
+node_modules/
+package-lock.json
+id.json
+*.key
+*.json (除非需要特定 JSON 文件)
